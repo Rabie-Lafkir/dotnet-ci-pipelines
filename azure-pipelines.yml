@@ -1,0 +1,270 @@
+# ASP.NET
+# Build and test ASP.NET projects.
+# Add steps that publish symbols, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/apps/aspnet/build-aspnet-4
+
+pr:
+  autoCancel: true
+  branches:
+    include:
+      - master
+
+trigger:
+  branches:
+    include:
+    - releases/*
+    exclude:
+    - master
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  solution: '*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  DOCKER_DRIVER: overlay
+  CONTAINER_IMAGE: codeclimate/codeclimate
+  CONTAINER_TAG: '0.85.2'
+  RESHARPER_CLI_NAME: 'JetBrains.ReSharper.CommandLineTools.Unix'
+  RESHARPER_CLI_VERSION: "2019.2.3"
+  # set RESHARPER_CLI_VERSION=2019.2.3
+
+resources:
+  containers:
+  - container: mysql
+    image: mysql:5.7.29
+    ports: 
+      - 3306:3306
+    options: -e MYSQL_ROOT_PASSWORD=mysecretpw
+
+  - container: pg11
+    image: postgres:11
+    ports: 
+      - 5432:5432
+    options: -e POSTGRES_PASSWORD=mysecretpassword
+
+  - container: mssql
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    ports: 
+      # - 1433
+      - 1433:1433
+    env:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: yourStrong(!)Password
+      MSSQL_PID: Express
+    options: --name mssql
+
+jobs:
+- job: test
+  steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET Core sdk 3.1'
+      inputs:
+        packageType: sdk
+        version: 3.1.413
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetToolInstaller@1
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '$(solution)'
+    - task: CmdLine@2
+      displayName: 'enablesqlite'
+      inputs:
+        script: |
+          cp ./MyProject.Repository.Test/Data/appSettings.gitlab.json ./MyProject.Repository.Test/Data/AppSettings.json
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        arguments: '/p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput="./TestResults/"'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/TestResults/coverage.opencover.xml'
+
+    - task: VSBuild@1
+      inputs:
+        solution: '$(solution)'
+        msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:PackageLocation="$(build.artifactStagingDirectory)"'
+        platform: '$(buildPlatform)'
+        configuration: '$(buildConfiguration)'
+
+- job: unit_test_db_mssql_npm
+  services:
+    mssql: mssql
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
+  - script: echo Hello, world!
+    displayName: 'Run a one-line script'
+
+
+  - task: CmdLine@2
+    displayName: 'pip'
+    inputs:
+      script: 'pip install pyodbc'
+      workingDirectory: '$(build.sourcesdirectory)'
+  - task: PowerShell@2
+    displayName: 'delay 10'
+    inputs:
+      targetType: 'inline'
+      script: |
+        # Write your PowerShell commands here.
+        
+        start-sleep -s 10
+  - task: CmdLine@2
+    displayName: 'docker logs'
+    inputs:
+      script: 'docker logs mssql'
+  - task: CmdLine@2
+    displayName: 'npm install'
+    inputs:
+      script: 'npm install mssql'
+      workingDirectory: '$(build.sourcesdirectory)'
+  - task: CmdLine@2
+    displayName: 'docker list'
+    inputs:
+      script: 'docker ps -all'
+  - task: CmdLine@2
+    displayName: 'sqlcmd'
+    inputs:
+      script: 'sqlcmd -S localhost -d master -U sa -P "yourStrong(!)Password" -Q "SELECT @@version;"'
+
+- job: unit_test_db_mssql
+  # condition: eq('${{ variables.runDbTests }}', 'true')
+  # continueOnError: true
+  pool:
+    vmImage: 'ubuntu-latest'
+  services:
+    localhostsqlserver: mssql
+
+  steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET Core sdk 3.1'
+      inputs:
+        packageType: sdk
+        version: 3.1.413
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetToolInstaller@1
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '$(solution)'
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: 'env | sort'
+
+        #  echo Write your commands here...
+        #   echo ${{agent.services.localhostsqlserver.ports.1433}}
+        #   echo Write your commands here end...
+    - task: PowerShell@2
+      displayName: 'delay 10'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Write your PowerShell commands here.
+          
+          start-sleep -s 10
+    - task: CmdLine@2
+      displayName: 'docker logs'
+      inputs:
+        script: 'docker logs mssql'
+    - task: CmdLine@2
+      displayName: 'enabledb'
+      inputs:
+        script: |
+          cp ./MyProject.Repository.Test/Data/appSettings.devops.mssql.json ./MyProject.Repository.Test/Data/AppSettings.json
+    - task: DotNetCoreCLI@2
+      displayName: 'database tests'
+      inputs:
+        command: 'test'
+        workingDirectory: MyProject.Repository.Test
+        arguments: '/p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput="./TestResults/"'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/TestResults/coverage.opencover.xml'
+
+- job: unit_test_db_postgres
+  # condition: eq('${{ variables.runDbTests }}', 'true')
+  pool:
+    vmImage: 'ubuntu-latest'
+  services:
+    localhost_postgres: pg11
+  steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET Core sdk 3.1'
+      inputs:
+        packageType: sdk
+        version: 3.1.413
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetToolInstaller@1
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '$(solution)'
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: 'env | sort'
+
+      # echo Write your commands here...
+      # echo ${{agent.services.localhost_postgres.ports.5432}}
+      # echo Write your commands here end...
+    - task: CmdLine@2
+      displayName: 'enabledb'
+      inputs:
+        script: |
+          cp ./MyProject.Repository.Test/Data/appSettings.devops.postgres.json ./MyProject.Repository.Test/Data/AppSettings.json
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        workingDirectory: MyProject.Repository.Test
+        arguments: '/p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput="./TestResults/"'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/TestResults/coverage.opencover.xml'
+
+- job: unit_test_db_mysql
+  # condition: eq('${{ variables.runDbTests }}', 'true')
+  pool:
+    vmImage: 'ubuntu-latest'
+  services:
+    localhost_mysql: mysql
+  steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET Core sdk 3.1'
+      inputs:
+        packageType: sdk
+        version: 3.1.413
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+    - task: NuGetToolInstaller@1
+    - task: NuGetCommand@2
+      inputs:
+        restoreSolution: '$(solution)'
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: 'env | sort'
+
+      #   echo Write your commands here...
+      # echo ${{agent.services.localhost_mysql.ports.3306}}
+      # echo Write your commands here end...
+    - task: CmdLine@2
+      displayName: 'enabledb'
+      inputs:
+        script: |
+          cp ./MyProject.Repository.Test/Data/appSettings.devops.mysql.json ./MyProject.Repository.Test/Data/AppSettings.json
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        workingDirectory: MyProject.Repository.Test
+        arguments: '/p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput="./TestResults/"'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/TestResults/coverage.opencover.xml'

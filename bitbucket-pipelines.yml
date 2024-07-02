@@ -1,0 +1,156 @@
+# This is a sample build configuration for .NET Core.
+# Check our guides at https://confluence.atlassian.com/x/5Q4SMw for more examples.
+# Only use spaces to indent your .yml configuration.
+# -----
+# You can specify a custom docker image from Docker Hub as your build environment.
+image: mcr.microsoft.com/dotnet/sdk:3.1
+
+definitions: 
+  services: 
+    mysql: 
+      image: mysql:5.7.29
+      variables:
+        MYSQL_DATABASE: "mockDb"
+        MYSQL_ROOT_PASSWORD: "mysecretpw"
+    pg11: 
+      image: postgres:11
+      variables:
+        POSTGRES_DB: mockDb
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: "mysecretpassword"
+        POSTGRES_HOST_AUTH_METHOD: trust
+    mssql: 
+      image: mcr.microsoft.com/mssql/server:2019-latest
+      variables:
+        GIT_SUBMODULE_STRATEGY: recursive
+        ACCEPT_EULA: Y
+        SA_PASSWORD: yourStrong(!)Password
+
+# yml validator
+# https://bitbucket-pipelines.prod.public.atl-paas.net/validator
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Build and test
+          caches:
+            - dotnetcore
+          script: # Modify the comma`nds below to build your repository.
+            - dotnet restore
+            - dotnet build
+            - cp MyProject.Repository.Test/Data/appSettings.gitlab.json MyProject.Repository.Test/Data/AppSettings.json
+            - dotnet test --logger "junit" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput='./TestResults/'
+            # https://confluence.atlassian.com/bitbucket/test-reporting-in-pipelines-939708543.html move junit reports need to do for each test project
+            - mv MyProject.Test/TestResults MyProject.Test/test-results
+            - mv MyProject.Repository.Test/TestResults MyProject.Repository.Test/test-results
+            - dotnet tool install dotnet-reportgenerator-globaltool --tool-path tools
+            - ./tools/reportgenerator "-reports:**/test-results/coverage.opencover.xml;" "-targetdir:Reports" -reportTypes:TextSummary;
+            - ./tools/reportgenerator "-reports:**/test-results/coverage.opencover.xml;" "-targetdir:Reports" -reportTypes:Html;
+            - ./tools/reportgenerator "-reports:**/test-results/coverage.opencover.xml;" "-targetdir:Reports" -reportTypes:Badges;
+            - cat ./Reports/Summary.txt
+            # - pipe: atlassian/bitbucket-upload-file:0.1.2
+            #   variables:
+            #     BITBUCKET_USERNAME: $BITBUCKET_USERNAME
+            #     BITBUCKET_APP_PASSWORD: $BITBUCKET_APP_PASSWORD
+            #     FILENAME: 'Reports'
+          artifacts:
+            - Reports/**
+            # - curl -X POST "https://${BB_AUTH_STRING}@api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" --form files=@"Reports"
+      - step:
+              name: unit_test_db_mysql
+              script:
+                - dotnet restore --packages="$NUGET_PACKAGES_DIRECTORY"
+                - cd MyProject.Repository.Test
+                - cp ./Data/appSettings.devops.mysql.json ./Data/AppSettings.json
+                - dotnet test --logger "junit" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput='./TestResults/'
+                - mv TestResults test-results
+              services: 
+                - mysql
+      - step:
+              name: unit_test_db_mssql
+              script:
+                # - ignore failure
+                # - set +e
+                - sleep 10
+                - dotnet restore --packages="$NUGET_PACKAGES_DIRECTORY"
+                - cd MyProject.Repository.Test
+                - cp ./Data/appSettings.bitbucket.mssql.json ./Data/AppSettings.json
+                - dotnet test --logger "junit" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput='./TestResults/' || true
+                - mv TestResults test-results
+                # Enable exit on non 0
+                # - set -e
+              services: 
+                - mssql
+      - step:
+              name: unit_test_db_postgres
+              script:
+                - dotnet restore --packages="$NUGET_PACKAGES_DIRECTORY"
+                - cd MyProject.Repository.Test
+                - cp ./Data/appSettings.devops.postgres.json ./Data/AppSettings.json
+                - dotnet test --logger "junit" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput='./TestResults/'
+                - mv TestResults test-results
+              services: 
+                - pg11
+      - step:
+          name: Resharper cli
+          script:
+            # ignore failure
+            - set +e
+            - dotnet restore --packages="$NUGET_PACKAGES_DIRECTORY"
+            - >
+              if [ ! -d "resharper" ]; then
+                apt update && apt install -y curl zip unzip
+                curl -LO "https://download.jetbrains.com/resharper/ReSharperUltimate.$RESHARPER_CLI_VERSION/$RESHARPER_CLI_NAME.$RESHARPER_CLI_VERSION.zip"
+                unzip -q $RESHARPER_CLI_NAME.$RESHARPER_CLI_VERSION.zip -d "resharper"
+              fi
+            - mkdir -p CodeQuality
+            - files=(*.sln)
+            - sh ./resharper/dupfinder.sh "${files[0]}" --output=CodeQuality/dupfinderReport.html --format=Html
+            - sh ./resharper/inspectcode.sh "${files[0]}" --output=CodeQuality/inspectcodeReport.html --format=Html
+            # - pipe: atlassian/bitbucket-upload-file:0.1.2
+            #   variables:
+            #     BITBUCKET_USERNAME: $BITBUCKET_USERNAME
+            #     BITBUCKET_APP_PASSWORD: $BITBUCKET_APP_PASSWORD
+            #     FILENAME: 'CodeQuality'
+          artifacts:
+            - CodeQuality/**
+            # - curl -X POST "https://${BB_AUTH_STRING}@api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}/downloads" --form files=@"CodeQuality"
+  custom:
+    Code_Quality:  
+      - step:
+          name: bitbucket code quality
+          script:
+          - dotnet restore --packages="$NUGET_PACKAGES_DIRECTORY"
+
+          - pipe: snyk/snyk-scan:0.2.0
+            variables:
+              SNYK_TOKEN: $SNYK_TOKEN
+              LANGUAGE: "nuget"
+              SEVERITY_THRESHOLD: "high"
+              DONT_BREAK_BUILD: "true"
+              MONITOR: "true"
+              TARGET_FILE: "MyProject.sln"
+
+          - pipe: sonarsource/sonarcloud-scan:1.0.1
+            variables:
+              EXTRA_ARGS: -Dsonar.projectDescription=\"Project with sonarcloud-scan pipe\" -Dsonar.eslint.reportPaths=\"report.json\"
+              SONAR_SCANNER_OPTS: -Xmx512m
+              DEBUG: "true"
+
+          - ls
+    Code_Docs:
+      - step:
+          name: docfx
+          image: mono:latest
+          script:
+            - apt update && apt install -y curl zip unzip
+            - curl -LO "https://github.com/dotnet/docfx/releases/download/v2.48/docfx.zip"
+            - unzip -q docfx.zip -d "docfx"
+            - mono ./docfx/docfx.exe
+          artifacts:
+              - _site/**
+
+
+## to open artifacts download artifact.*.tar.gz from pipeline
+# run tar -zxvf artifacts download artifact.*.tar.gz
+# to unzip
